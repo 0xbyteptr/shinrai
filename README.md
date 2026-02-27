@@ -1,24 +1,6 @@
-# shinrai — Character-level RNN trainer
+# shinrai — A vibe coded Character-level RNN trainer
 
 A modular, production-quality character-level language model trainer supporting LSTM and GRU backends.
-
-## Project layout
-
-```
-shinrai/
-├── shinrai/
-│   ├── __init__.py
-│   ├── config.py        # Dataclass-based configuration
-│   ├── data.py          # Text fetching, crawling, dataset
-│   ├── model.py         # CharRNN (LSTM / GRU), weight tying
-│   ├── trainer.py       # Training loop, checkpointing, early stopping
-│   ├── generate.py      # Nucleus + temperature sampling
-│   └── logging.py       # Rich/plain console helpers
-├── train.py             # Entry point: train a model
-├── generate.py          # Entry point: sample from a saved checkpoint
-├── requirements.txt
-└── README.md
-```
 
 ## Installation
 
