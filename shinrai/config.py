@@ -55,6 +55,8 @@ class TrainConfig:
     patience: int = 5          # early stopping (0 = disabled)
     lr_patience: int = 3       # ReduceLROnPlateau patience
     device: Optional[str] = None
+    num_workers: int = 0        # DataLoader workers to accelerate loading
+    use_amp: bool = False       # Enable automatic mixed precision (CUDA)
 
 
 @dataclass
@@ -138,6 +140,10 @@ def add_train_args(p: argparse.ArgumentParser) -> None:
                    help="ReduceLROnPlateau patience")
     p.add_argument("--device",      default=None,
                    help="torch device string, e.g. 'cuda', 'cpu'")
+    p.add_argument("--num_workers", type=int,   default=0,
+                   help="Number of worker processes for data loading")
+    p.add_argument("--use_amp",     action="store_true",
+                   help="Enable automatic mixed precision (NVIDIA GPUs)")
 
 
 def add_checkpoint_args(p: argparse.ArgumentParser) -> None:
@@ -198,6 +204,8 @@ def config_from_namespace(args: argparse.Namespace) -> Config:
             patience=_get("patience", 5),
             lr_patience=_get("lr_patience", 3),
             device=_get("device"),
+            num_workers=_get("num_workers", 0),
+            use_amp=_get("use_amp", False),
         ),
         checkpoint=CheckpointConfig(
             save_checkpoint=_get("save_checkpoint"),

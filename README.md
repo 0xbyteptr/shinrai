@@ -37,7 +37,7 @@ status object when the run finishes.  Example:
 
 ```bash
 # start the server on the remote machine
-python trainer_server.py --host 0.0.0.0 --port 8000
+python trainer_server.py --host 0.0.0.0 --port 8000 --save_checkpoint /path/to/remote.pt
 
 # from your laptop submit a job using identical arguments to `train.py`
 python remote_trainer.py --server http://server:8000 \
@@ -46,6 +46,11 @@ python remote_trainer.py --server http://server:8000 \
 
 Both scripts are lightweight wrappers around the core :mod:`shinrai` APIs,
 so you can easily integrate them into your own orchestration system.
+
+The server accepts an optional ``--save_checkpoint`` argument; any job
+payloads received will have their ``checkpoint.save_checkpoint`` field
+overwritten with this value, ensuring all runs write to a consistent
+location regardless of what the client submits.
 
 ## Key options
 
@@ -65,3 +70,5 @@ so you can easily integrate them into your own orchestration system.
 | `--temperature` | `0.8` | Sampling temperature |
 | `--top_p` | `0.9` | Nucleus sampling p (1.0 = off) |
 | `--save_every` | `1` | Periodically write checkpoint every N epochs |
+| `--num_workers` | `0` | DataLoader worker processes (set >0 for faster loading) |
+| `--use_amp` | (off) | Enable mixed precision training on CUDA GPUs |

@@ -43,6 +43,11 @@ def train_endpoint():
         log.error(f"Invalid configuration: {exc}")
         return jsonify({"error": str(exc)}), 400
 
+    # enforce server-wide checkpoint override if requested
+    default_ckpt = app.config.get("DEFAULT_SAVE_CHECKPOINT")
+    if default_ckpt is not None:
+        cfg.checkpoint.save_checkpoint = default_ckpt
+
     try:
         model, vocab = run_training(cfg)
     except Exception as exc:
@@ -68,12 +73,16 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Host/IP to bind the server")
     p.add_argument("--port", type=int, default=8000,
                    help="Port to listen on")
+    p.add_argument("--save_checkpoint", default=None,
+                   help="If provided, server will force every job to save to this path")
     return p
 
 
 def main() -> None:
     args = build_parser().parse_args()
     log.banner("shinrai — trainer server")
+    # store default checkpoint path on app config for access in handler
+    app.config["DEFAULT_SAVE_CHECKPOINT"] = args.save_checkpoint
     app.run(host=args.host, port=args.port)
 
 

@@ -74,19 +74,20 @@ def save_checkpoint(
     scheduler,
     epoch: int,
     vocab: Vocabulary,
+    scaler: Optional[torch.cuda.amp.GradScaler] = None,
 ) -> None:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state": model.state_dict(),
-            "model_config": model.config_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "scheduler_state": scheduler.state_dict() if scheduler else None,
-            "chars": vocab.chars,
-        },
-        path,
-    )
+    data = {
+        "epoch": epoch,
+        "model_state": model.state_dict(),
+        "model_config": model.config_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "scheduler_state": scheduler.state_dict() if scheduler else None,
+        "chars": vocab.chars,
+    }
+    if scaler is not None:
+        data["scaler_state"] = scaler.state_dict()
+    torch.save(data, path)
 
 
 def load_checkpoint(
@@ -95,11 +96,12 @@ def load_checkpoint(
     optimizer: Optional[optim.Optimizer],
     scheduler,
     device: torch.device,
-) -> tuple[int, list[str]]:
+) -> tuple[int, list[str], Optional[dict]]:
     """Load *path* into *model* (and optionally *optimizer*/*scheduler*).
 
     Returns:
-        (epoch, chars)  — epoch the checkpoint was saved at and the vocab.
+        (epoch, chars, scaler_state)  — epoch the checkpoint was saved at,
+        the vocab, and (if present) the AMP scaler state.
     """
     ckpt = torch.load(path, map_location=device)
     model.load_state_dict(ckpt["model_state"])
@@ -116,10 +118,19 @@ def load_checkpoint(
         except Exception:
             pass
 
+    # AMP scaler may be restored by caller if they have one
+    scaler_state = ckpt.get("scaler_state")
+    if scaler_state is not None:
+        try:
+            return epoch, chars, scaler_state
+        except Exception:
+            pass
+
     epoch = ckpt.get("epoch", 0)
     chars = ckpt.get("chars", [])
+    scaler_state = ckpt.get("scaler_state")
     log.success(f"Loaded checkpoint '{path}'  (epoch {epoch})")
-    return epoch, chars
+    return epoch, chars, scaler_state
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -161,6 +172,14 @@ class Trainer:
         )
         self.criterion = nn.CrossEntropyLoss()
 
+        # AMP scaler if requested and running on CUDA
+        self.use_amp = train_cfg.use_amp and torch.cuda.is_available()
+        self.scaler: Optional[torch.cuda.amp.GradScaler]
+        if self.use_amp:
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
+
         self._start_epoch = 0
         self._best_val_loss = float("inf")
         self._no_improve = 0
@@ -176,7 +195,7 @@ class Trainer:
 
         if path:
             try:
-                epoch, chars = load_checkpoint(
+                epoch, chars, scaler_state = load_checkpoint(
                     path, self.model, self.optimizer, self.scheduler, self.device
                 )
                 self._start_epoch = epoch
@@ -186,6 +205,11 @@ class Trainer:
                         "Using checkpoint vocabulary."
                     )
                     self.vocab = Vocabulary.from_chars(chars)
+                if scaler_state and self.scaler is not None:
+                    try:
+                        self.scaler.load_state_dict(scaler_state)
+                    except Exception:
+                        pass
             except Exception as exc:
                 log.error(f"Failed to load checkpoint: {exc}")
 
@@ -196,6 +220,7 @@ class Trainer:
             self.ckpt.save_checkpoint,
             self.model, self.optimizer, self.scheduler,
             epoch, self.vocab,
+            self.scaler if self.use_amp else None,
         )
         log.success(f"  Checkpoint saved: {self.ckpt.save_checkpoint}{label}")
 
@@ -216,10 +241,12 @@ class Trainer:
         else:
             train_ds, val_ds = full_ds, None
 
-        # pin_memory=True with num_workers=0 can deadlock on Linux+CUDA;
-        # only enable it when workers are actually spawning background threads.
+        # pin_memory helps when using CUDA; only enable if workers are
+        # spawning threads for loading.
         pin = torch.cuda.is_available() and self.device.type == "cuda"
-        kw = dict(batch_size=self.cfg.batch_size, pin_memory=pin, num_workers=0)
+        num_workers = max(0, self.cfg.num_workers)
+        kw = dict(batch_size=self.cfg.batch_size, pin_memory=pin,
+                  num_workers=num_workers, persistent_workers=num_workers>0)
         train_loader = DataLoader(train_ds, shuffle=True, **kw)
         val_loader   = DataLoader(val_ds, shuffle=False, **kw) if val_ds else None
 
@@ -247,6 +274,8 @@ class Trainer:
     # ── One epoch of training ─────────────────────────────────────────────────
 
     def _train_epoch(self, loader: DataLoader, epoch: int) -> float:
+        # enable cuDNN autotuner for potential speed-ups on fixed input
+        torch.backends.cudnn.benchmark = True
         self.model.train()
         total_loss, total_tokens = 0.0, 0
         n_batches = len(loader)
@@ -275,7 +304,11 @@ class Trainer:
             if self.cfg.grad_clip > 0:
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
 
-            self.optimizer.step()
+            if self.use_amp and self.scaler is not None:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
 
             tokens = B * T
             total_loss  += loss.item() * tokens
