@@ -19,12 +19,29 @@ from typing import Literal, Optional
 
 @dataclass
 class DataConfig:
-    """Where and how to obtain training text."""
+    """Where and how to obtain training text.
+
+    ``continue_from`` lets you load preprocessed data (and vocab) from a
+    file saved by a previous run.  When present the other acquisition flags
+    are ignored.
+
+    ``crawl`` is now an integer representing the desired crawl depth.  A
+    value of ``0`` (the default) disables crawling; ``1`` is the standard
+    single‑page crawl.  The separate ``crawl_depth`` field is retained for
+    backwards compatibility but is ignored if ``crawl`` is nonzero.
+    """
 
     # Source selection (mutually exclusive)
     text_file: Optional[str] = None
     use_seed_articles: bool = False
-    crawl: bool = False
+    # crawl depth (0 = disabled).  Previously a bool flag.
+    crawl: int = 0
+    # concurrency settings to speed acquisition
+    fetch_workers: int = 4     # parallel fetches for seed articles
+    crawl_workers: int = 4     # parallel fetches during crawling
+    # instead of fetching/encoding text, resume from a previously saved
+    # data file (torch.save of ``{'encoded': [...], 'chars': [...]}'``)
+    continue_from: Optional[str] = None
 
     url: str = "https://en.wikipedia.org/wiki/Artificial_intelligence"
     crawl_depth: int = 1
@@ -57,6 +74,9 @@ class TrainConfig:
     device: Optional[str] = None
     num_workers: int = 0        # DataLoader workers to accelerate loading
     use_amp: bool = False       # Enable automatic mixed precision (CUDA)
+    use_compile: bool = False   # torch.compile (Dynamo) for potential speedups
+    accumulate_steps: int = 1   # gradient accumulation to simulate larger batch
+    data_parallel: bool = False # wrap model in nn.DataParallel if multiple GPUs
 
 
 @dataclass
@@ -105,8 +125,19 @@ def add_data_args(p: argparse.ArgumentParser) -> None:
                      help="Local .txt or .pdf file to train on")
     src.add_argument("--use_seed_articles", action="store_true",
                      help="Fetch curated Wikipedia seed articles")
-    src.add_argument("--crawl", action="store_true",
-                     help="Crawl links starting from --url")
+    # ``--crawl`` may be given without a value (defaults to depth=1) or
+    # with an integer specifying depth.  argparse returns None when the flag
+    # is absent, an int when provided, and 1 when written ``--crawl`` alone.
+    src.add_argument("--crawl", nargs="?", const=1, type=int, metavar="DEPTH",
+                     help="Crawl links starting from --url (optional depth)")
+    p.add_argument("--fetch_workers", type=int, default=4,
+                   help="Number of parallel downloads when fetching seed articles")
+    p.add_argument("--crawl_workers", type=int, default=4,
+                   help="Number of concurrent requests during crawling")
+    p.add_argument("--continue_from", metavar="PATH",
+                   help="Load preprocessed encoded data from a .pt file (skips acquisition).\n"
+                   "If the given file is a training checkpoint, it will be treated"
+                   "as --load_checkpoint instead and data will be acquired normally.")
 
     p.add_argument("--url",
                    default="https://en.wikipedia.org/wiki/Artificial_intelligence",
@@ -144,6 +175,12 @@ def add_train_args(p: argparse.ArgumentParser) -> None:
                    help="Number of worker processes for data loading")
     p.add_argument("--use_amp",     action="store_true",
                    help="Enable automatic mixed precision (NVIDIA GPUs)")
+    p.add_argument("--use_compile", action="store_true",
+                   help="Run model through torch.compile() if available")
+    p.add_argument("--accumulate_steps", type=int, default=1,
+                   help="Accumulate gradients over this many batches")
+    p.add_argument("--data_parallel", action="store_true",
+                   help="Wrap model in DataParallel if multiple GPUs")
 
 
 def add_checkpoint_args(p: argparse.ArgumentParser) -> None:
@@ -182,7 +219,10 @@ def config_from_namespace(args: argparse.Namespace) -> Config:
         data=DataConfig(
             text_file=_get("text_file"),
             use_seed_articles=_get("use_seed_articles", False),
-            crawl=_get("crawl", False),
+            crawl=_get("crawl", 0) or 0,
+            fetch_workers=_get("fetch_workers", 4),
+            crawl_workers=_get("crawl_workers", 4),
+            continue_from=_get("continue_from"),
             url=_get("url", "https://en.wikipedia.org/wiki/Artificial_intelligence"),
             crawl_depth=_get("crawl_depth", 1),
             max_pages=_get("max_pages", 20),
@@ -206,6 +246,9 @@ def config_from_namespace(args: argparse.Namespace) -> Config:
             device=_get("device"),
             num_workers=_get("num_workers", 0),
             use_amp=_get("use_amp", False),
+            use_compile=_get("use_compile", False),
+            accumulate_steps=_get("accumulate_steps", 1),
+            data_parallel=_get("data_parallel", False),
         ),
         checkpoint=CheckpointConfig(
             save_checkpoint=_get("save_checkpoint"),

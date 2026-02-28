@@ -1,3 +1,4 @@
 *.pt
 The anarchist cookbook*.txt
 __pycache__/
+.vscode/

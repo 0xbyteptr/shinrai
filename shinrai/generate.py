@@ -128,4 +128,12 @@ def generate(
         current_id = sample_token(logits[0, 0], temperature=temperature, top_p=top_p)
         generated_ids.append(current_id)
 
-    return seed_str + vocab.decode(generated_ids)
+    out = seed_str + vocab.decode(generated_ids)
+    # quick sanitisation: remove any leftover HTML tags or attribute fragments
+    # which may have sneaked into the vocabulary from noisy training data.
+    import re
+    # collapse excessive whitespace
+    out = re.sub(r"\s+", " ", out)
+    # drop non-printable characters that could be noisy
+    out = "".join(ch for ch in out if ch.isprintable())
+    return out

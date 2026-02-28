@@ -63,7 +63,12 @@ def load_model_from_checkpoint(
     model_cfg["vocab_size"] = len(vocab)
 
     model = CharRNN.from_config(model_cfg, dropout=0.0).to(device)
-    model.load_state_dict(ckpt["model_state"])
+    state = ckpt.get("model_state", {})
+    # some training-time wrappers (DataParallel, torch.compile) add an
+    # ``_orig_mod`` prefix to every parameter.  Remove it so loading succeeds.
+    if any(k.startswith("_orig_mod.") for k in state.keys()):
+        state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+    model.load_state_dict(state)
     model.eval()
 
     epoch = ckpt.get("epoch", "?")

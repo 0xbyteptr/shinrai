@@ -20,6 +20,12 @@ import torch
 from bs4 import BeautifulSoup
 from torch.utils.data import Dataset
 
+try:
+    from tqdm import tqdm  # type: ignore[import]
+    _HAS_TQDM = True
+except ImportError:
+    _HAS_TQDM = False
+
 from shinrai.logging import log
 
 try:
@@ -74,16 +80,27 @@ def fetch_text(url: str, timeout: int = 10) -> str:
         return ""
 
 
-def fetch_seed_articles() -> str:
-    """Fetch all curated seed articles and concatenate their text."""
+def fetch_seed_articles(concurrency: int = 4) -> str:
+    """Fetch all curated seed articles and concatenate their text.
+
+    Network requests are dispatched in parallel using threads; ``concurrency``
+    controls the maximum number of simultaneous connections.  Default 4 keeps
+    memory low while still utilising I/O parallelism.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     texts: list[str] = []
-    for url in SEED_URLS:
-        text = fetch_text(url)
-        if len(text) > _MIN_TEXT_LENGTH:
-            texts.append(text)
-            log.info(f"  ✓ {url}  ({len(text):,} chars)")
-        else:
-            log.warn(f"  ✗ {url}  (skipped — too short)")
+    with ThreadPoolExecutor(max_workers=concurrency) as exe:
+        futures = {exe.submit(fetch_text, url): url for url in SEED_URLS}
+        iterator = tqdm(as_completed(futures), total=len(futures), desc="fetching") if _HAS_TQDM else as_completed(futures)
+        for fut in iterator:
+            url = futures[fut]
+            text = fut.result()
+            if len(text) > _MIN_TEXT_LENGTH:
+                texts.append(text)
+                log.info(f"  ✓ {url}  ({len(text):,} chars)")
+            else:
+                log.warn(f"  ✗ {url}  (skipped — too short)")
     return "\n".join(texts)
 
 
@@ -92,41 +109,70 @@ def crawl_text(
     max_pages: int = 20,
     max_depth: int = 1,
     timeout: int = 10,
+    concurrency: int = 4,
 ) -> str:
-    """BFS crawl within the same domain.  Returns concatenated paragraph text."""
+    """BFS crawl within the same domain.  Returns concatenated paragraph text.
+
+    The crawl uses a thread pool to fetch multiple pages simultaneously, which
+    greatly speeds up IO-bound traversal while respecting the page/depth
+    limits.  ``concurrency`` controls the number of worker threads used.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     visited: set[str] = set()
     queue: deque[tuple[str, int]] = deque([(start_url, 0)])
     start_netloc = urlparse(start_url).netloc
     session = requests.Session()
     texts: list[str] = []
 
-    while queue and len(visited) < max_pages:
-        url, depth = queue.popleft()
-        if url in visited:
-            continue
-        visited.add(url)
+    def fetch_and_parse(url: str) -> tuple[str, str]:
+        """Return (url, parsed_text) or raise."""
+        r = session.get(url, headers=_HTTP_HEADERS, timeout=timeout)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+        text = " ".join(p.get_text() for p in soup.find_all("p")).lower()
+        return url, text
 
-        try:
-            r = session.get(url, headers=_HTTP_HEADERS, timeout=timeout)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-            text = " ".join(p.get_text() for p in soup.find_all("p")).lower()
-            if len(text.strip()) > _MIN_TEXT_LENGTH:
-                texts.append(text)
-                log.info(f"  crawled: {url}  ({len(text):,} chars)")
+    with ThreadPoolExecutor(max_workers=concurrency) as exe:
+        futures: dict = {}
+        total_to_fetch = max_pages
+        pbar = tqdm(total=total_to_fetch, desc="crawling") if _HAS_TQDM else None
+        while queue and len(visited) < max_pages:
+            # dispatch up to concurrency tasks
+            while queue and len(futures) < concurrency and len(visited) + len(futures) < max_pages:
+                url, depth = queue.popleft()
+                if url in visited:
+                    continue
+                futures[exe.submit(fetch_and_parse, url)] = (url, depth)
 
-            if depth < max_depth:
-                for a in soup.find_all("a", href=True):
-                    href = urljoin(url, a["href"])
-                    parsed = urlparse(href)
-                    if (
-                        parsed.scheme in ("http", "https")
-                        and parsed.netloc == start_netloc
-                        and href not in visited
-                    ):
-                        queue.append((href, depth + 1))
-        except Exception as exc:
-            log.warn(f"  crawl error at {url}: {exc}")
+            # process completed fetches
+            for fut in as_completed(list(futures.keys())):
+                url, depth = futures.pop(fut)
+                if url in visited:
+                    continue
+                visited.add(url)
+                if pbar:
+                    pbar.update(1)
+                try:
+                    _, text = fut.result()
+                    if len(text.strip()) > _MIN_TEXT_LENGTH:
+                        texts.append(text)
+                        log.info(f"  crawled: {url}  ({len(text):,} chars)")
+                    if depth < max_depth:
+                        soup = BeautifulSoup(text, "html.parser")
+                        for a in soup.find_all("a", href=True):
+                            href = urljoin(url, a["href"])
+                            parsed = urlparse(href)
+                            if (
+                                parsed.scheme in ("http", "https")
+                                and parsed.netloc == start_netloc
+                                and href not in visited
+                            ):
+                                queue.append((href, depth + 1))
+                except Exception as exc:
+                    log.warn(f"  crawl error at {url}: {exc}")
+        if pbar:
+            pbar.close()
 
     return "\n".join(texts)
 
@@ -215,7 +261,7 @@ class CharDataset(Dataset):
 # High-level helper
 # ──────────────────────────────────────────────────────────────────────────────
 
-_FALLBACK_TEXT = "the quick brown fox jumps over the lazy dog. " * 600
+_FALLBACK_TEXT = "Not enough text could be acquired from the specified source.  Please check your URL, crawl settings, or file path, and try again."
 
 
 def acquire_text(
@@ -226,6 +272,8 @@ def acquire_text(
     crawl_depth: int = 1,
     max_pages: int = 20,
     min_length: int = 200,
+    fetch_workers: int = 4,
+    crawl_workers: int = 4,
 ) -> str:
     """Route to the correct acquisition strategy and return raw text."""
     text = ""
@@ -239,11 +287,16 @@ def acquire_text(
 
     elif use_seed_articles:
         log.info("Fetching curated seed articles…")
-        text = fetch_seed_articles()
+        text = fetch_seed_articles(concurrency=fetch_workers)
 
     elif crawl:
         log.info(f"Crawling {url}  (depth={crawl_depth}, max={max_pages} pages)…")
-        text = crawl_text(url, max_pages=max_pages, max_depth=crawl_depth)
+        text = crawl_text(
+            url,
+            max_pages=max_pages,
+            max_depth=crawl_depth,
+            concurrency=crawl_workers,
+        )
 
     else:
         log.info(f"Fetching {url}…")

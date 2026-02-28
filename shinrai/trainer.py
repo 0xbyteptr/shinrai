@@ -99,12 +99,26 @@ def load_checkpoint(
 ) -> tuple[int, list[str], Optional[dict]]:
     """Load *path* into *model* (and optionally *optimizer*/*scheduler*).
 
+    The checkpoint may have been saved with a different vocabulary than the
+    one used to construct *model*.  Previously we let :func:`load_state_dict`
+    raise an exception in that case; now we catch mismatches and fall back to
+    a non-strict load so that compatible parameters are restored and the
+    remaining weights (e.g. embedding/output layers) stay at their
+    initialized values.
+
     Returns:
         (epoch, chars, scaler_state)  — epoch the checkpoint was saved at,
         the vocab, and (if present) the AMP scaler state.
     """
     ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model_state"])
+
+    # try a strict load first so we catch unexpected missing keys, but don't
+    # crash if the shapes don't line up (vocab changed, etc.).
+    try:
+        model.load_state_dict(ckpt["model_state"])
+    except RuntimeError as exc:
+        log.warn(f"Model state dict mismatch: {exc}. loading partial weights.")
+        model.load_state_dict(ckpt["model_state"], strict=False)
 
     if optimizer is not None and "optimizer_state" in ckpt:
         try:
@@ -161,6 +175,30 @@ class Trainer:
         self.ckpt = ckpt_cfg
         self.device = device
 
+        # optionally wrap in DataParallel if user requests and multiple GPUs
+        if self.cfg.data_parallel and torch.cuda.device_count() > 1:
+            log.info(f"Using DataParallel across {torch.cuda.device_count()} GPUs")
+            self.model = nn.DataParallel(self.model)
+
+        # compile model if requested (PyTorch 2.0).  Triton is required for
+        # most backends; if it isn't installed the compiled model will raise an
+        # error on first call, so we proactively check by running a tiny
+        # inference and falling back if anything goes wrong.
+        if self.cfg.use_compile and hasattr(torch, "compile"):
+            try:
+                compiled = torch.compile(self.model)
+                # sanity check: run a tiny dummy forward to trigger backend
+                try:
+                    dummy = torch.zeros(1, 1, dtype=torch.long, device=self.device)
+                    _ = compiled(dummy)
+                    self.model = compiled
+                    log.info("Model compiled with torch.compile()")
+                except Exception as e2:
+                    log.warn(f"Compiled model failed at test run ({e2}); "
+                             "falling back to uncompiled model.")
+            except Exception as exc:
+                log.warn(f"Failed to compile model: {exc}")
+
         self.optimizer = optim.AdamW(
             model.parameters(), lr=train_cfg.lr, weight_decay=1e-4
         )
@@ -174,9 +212,14 @@ class Trainer:
 
         # AMP scaler if requested and running on CUDA
         self.use_amp = train_cfg.use_amp and torch.cuda.is_available()
-        self.scaler: Optional[torch.cuda.amp.GradScaler]
+        self.scaler: Optional[torch.amp.GradScaler]
         if self.use_amp:
-            self.scaler = torch.cuda.amp.GradScaler()
+            # simply create scaler; latest PyTorch auto-detects device
+            try:
+                self.scaler = torch.amp.GradScaler()
+            except TypeError:
+                # very old versions might not have amp; fall back to None
+                self.scaler = None
         else:
             self.scaler = None
 
@@ -290,25 +333,37 @@ class Trainer:
         else:
             iterator = loader
 
+        self.optimizer.zero_grad()
         for batch_idx, (xb, yb) in enumerate(iterator):
+            step_idx = batch_idx + 1
             if batch_idx == 0 and not _HAS_TQDM:
                 print(f"  Epoch {epoch} — {n_batches} batches…", flush=True)
-            xb, yb = xb.to(self.device), yb.to(self.device)
-            self.optimizer.zero_grad()
+            xb, yb = xb.to(self.device, non_blocking=True), yb.to(self.device, non_blocking=True)
 
-            logits, _ = self.model(xb)
-            B, T, V = logits.shape
-            loss = self.criterion(logits.view(B * T, V), yb.view(B * T))
-            loss.backward()
+            # forward / backward inside amp context if enabled
+            if self.use_amp and self.scaler is not None:
+                with torch.amp.autocast(device_type="cuda"):
+                    logits, _ = self.model(xb)
+                    B, T, V = logits.shape
+                    loss = self.criterion(logits.view(B * T, V), yb.view(B * T))
+                self.scaler.scale(loss).backward()
+            else:
+                logits, _ = self.model(xb)
+                B, T, V = logits.shape
+                loss = self.criterion(logits.view(B * T, V), yb.view(B * T))
+                loss.backward()
 
+            # accumulate gradients
             if self.cfg.grad_clip > 0:
                 nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
 
-            if self.use_amp and self.scaler is not None:
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                self.optimizer.step()
+            if step_idx % self.cfg.accumulate_steps == 0:
+                if self.use_amp and self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+                self.optimizer.zero_grad()
 
             tokens = B * T
             total_loss  += loss.item() * tokens
@@ -433,21 +488,83 @@ def run_training(cfg: Config) -> tuple[CharRNN, Vocabulary]:
 
     log.banner("shinrai — training")
 
-    # text acquisition
-    text = acquire_text(
-        text_file=cfg.data.text_file,
-        use_seed_articles=cfg.data.use_seed_articles,
-        crawl=cfg.data.crawl,
-        url=cfg.data.url,
-        crawl_depth=cfg.data.crawl_depth,
-        max_pages=cfg.data.max_pages,
-        min_length=cfg.model.seq_length + 2,
-    )
-    log.info(f"Total characters: {len(text):,}")
+    # text acquisition / loading
+    if cfg.data.continue_from:
+        log.info(f"Loading preprocessed data from {cfg.data.continue_from}")
+        ck = torch.load(cfg.data.continue_from, map_location="cpu")
+        # two possible valid formats: a data dump with 'encoded'/'chars', or a
+        # full training checkpoint.  The latter is commonly mistaken for the
+        # former, so we detect it and redirect the path into load_checkpoint.
+        if "encoded" in ck and "chars" in ck:
+            encoded = ck.get("encoded")
+            chars = ck.get("chars")
+            vocab = Vocabulary.from_chars(chars)
+            log.info(f"Loaded encoded data: {len(encoded):,} tokens, vocab={len(vocab)}")
+        elif "model_state" in ck:
+            log.warn("continue_from refers to a model checkpoint; "
+                     "treating it as --load_checkpoint instead.")
+            # set the checkpoint path and fall through to acquisition below
+            cfg.checkpoint.load_checkpoint = cfg.data.continue_from
+            cfg.data.continue_from = None
+            crawl_depth = cfg.data.crawl or cfg.data.crawl_depth
+            text = acquire_text(
+                text_file=cfg.data.text_file,
+                use_seed_articles=cfg.data.use_seed_articles,
+                crawl=crawl_depth > 0,
+                url=cfg.data.url,
+                crawl_depth=crawl_depth,
+                max_pages=cfg.data.max_pages,
+                min_length=cfg.model.seq_length + 2,
+            )
+            log.info(f"Total characters: {len(text):,}")
+            vocab = Vocabulary.from_text(text)
+            log.info(f"Vocabulary size: {len(vocab)}")
+            encoded = vocab.encode(text)
+        else:
+            raise RuntimeError("continue_from file missing 'encoded' or 'chars' keys")
+    else:
+        crawl_depth = cfg.data.crawl or cfg.data.crawl_depth
+        text = acquire_text(
+            text_file=cfg.data.text_file,
+            use_seed_articles=cfg.data.use_seed_articles,
+            crawl=crawl_depth > 0,
+            url=cfg.data.url,
+            crawl_depth=crawl_depth,
+            max_pages=cfg.data.max_pages,
+            min_length=cfg.model.seq_length + 2,
+            fetch_workers=cfg.data.fetch_workers,
+            crawl_workers=cfg.data.crawl_workers,
+        )
+        log.info(f"Total characters: {len(text):,}")
 
-    vocab = Vocabulary.from_text(text)
-    log.info(f"Vocabulary size: {len(vocab)}")
-    encoded = vocab.encode(text)
+        vocab = Vocabulary.from_text(text)
+        log.info(f"Vocabulary size: {len(vocab)}")
+        encoded = vocab.encode(text)
+
+    # If we're going to load a training checkpoint, its vocabulary may
+    # differ from the text we just acquired.  Earlier versions built the
+    # model before inspecting the checkpoint, which meant load_state_dict()
+    # could throw due to mismatched embedding/output dimensions.  To avoid
+    # that, check for a saved vocab now and (if necessary) override the
+    # vocabulary and re-encode the text so that the model we construct
+    # below will match the checkpoint exactly.
+    if cfg.checkpoint.load_checkpoint:
+        try:
+            ckpt = torch.load(cfg.checkpoint.load_checkpoint, map_location="cpu")
+            ck_chars = ckpt.get("chars")
+            if ck_chars:
+                if ck_chars != vocab.chars:
+                    log.warn(
+                        "Vocabulary in checkpoint differs from current data. "
+                        "Using checkpoint vocabulary."
+                    )
+                    vocab = Vocabulary.from_chars(ck_chars)
+                    # re-encode using checkpoint vocab; unknown chars map to space
+                    encoded = vocab.encode(text)
+        except Exception:
+            # silently ignore issues reading the checkpoint; they will be
+            # surfaced later during the actual load.
+            pass
 
     device = _resolve_device(cfg.train.device)
     log.info(f"Device: {device}")
