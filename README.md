@@ -68,7 +68,8 @@ Alternatively, run `python main.py` without arguments to open an interactive men
   invoked.
 - `main.py` acts as a lightweight CLI dispatcher using `argparse`.
 - `Makefile` provides shorthand targets and documents available options.
-- The tokenizer is word-based and simple; you can swap it for another implementation
-  by editing `tokenizer_word.py`.
+- The tokenizer is word-based and simple; recent updates improve parsing of
+  contractions ("you'll", "don't") and prevent stray spaces around apostrophes.
+  You can swap it for another implementation by editing `tokenizer_word.py`.
 
 Feel free to extend, refactor or package this into a proper Python module.

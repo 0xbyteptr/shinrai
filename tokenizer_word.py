@@ -16,8 +16,20 @@ class Tokenizer:
     # ------------------------------------------------------------------
     @staticmethod
     def _tokenize(text: str) -> list[str]:
-        """Tokenizacja na poziomie słów + interpunkcja jako osobne tokeny."""
-        return re.findall(r"\w+|[^\s\w]", text.lower())
+        """Tokenizacja na poziomie słów.
+
+        Pojedyncze tokeny obejmują słowa oraz znaki interpunkcyjne, ale
+        apostrofy wewnątrz słów nie są rozdzielane (dzięki temu
+        contractions takie jak "you'll" albo "don't" pozostają jednym
+        tokenem).  Stare regexy dzieliły apostrof na osobny token, co
+        prowadziło do dziwnych wyjść typu "you' ll".
+        """
+        # 
+        # r"\w+(?:'\w+)*" → słowo (alfanumeryczne) opcjonalnie z kilkoma
+        # segmentami zaczynającymi się apostrofem, np. don't, o'clock
+        # r"[^\s\w]"           → każdy inny nie-białoskracowy, nie-znak
+        #                    alfanumeryczny (czyli większość interpunkcji)
+        return re.findall(r"\w+(?:'\w+)*|[^\s\w]", text.lower())
 
     # ------------------------------------------------------------------
     def fit(self, texts: list[str]) -> "Tokenizer":
@@ -46,12 +58,21 @@ class Tokenizer:
             if skip_special and w in special:
                 continue
             words.append(w)
-        # Sklej z inteligentną spacją (nie dodawaj spacji przed interpunkcją)
+        # Sklej z inteligentną spacją (nie dodawaj spacji przed typową
+        # interpunkcją).  Po modyfikacji tokenizacji apostrofy są częścią
+        # słowa, więc "you'll" zostaje prawidłowo złożone bez przerw.
         out = ""
         for w in words:
-            if out and re.match(r"\w", w):
-                out += " "
-            out += w
+            if not out:
+                out = w
+                continue
+            # jeżeli następny token zaczyna się od litery lub apostrofu, dodaj
+            # spację; w przeciwnym razie przykład (',', '.') przyczepiamy go
+            # bez spacji.
+            if re.match(r"[\w']", w):
+                out += " " + w
+            else:
+                out += w
         return out
 
     # ------------------------------------------------------------------
