@@ -6,20 +6,23 @@ from tqdm import tqdm
 import pickle
 import os
 import math
+import argparse
 import matplotlib.pyplot as plt
 from model_gpt import GPTSmall
+from data_utils import load_tokens
 
 # ──────────────────────────────────────────────
-# CONFIG
+# DEFAULT CONFIG (can be overridden by CLI args)
 # ──────────────────────────────────────────────
-SEQ_LEN        = 100
-BATCH_SIZE     = 32
-EPOCHS         = 20
-LR             = 3e-4
-GRAD_CLIP      = 1.0
-WARMUP_STEPS   = 200
-CHECKPOINT_DIR = "checkpoints"
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+DEFAULT_SEQ_LEN        = 100
+DEFAULT_BATCH_SIZE     = 32
+DEFAULT_EPOCHS         = 20
+DEFAULT_LR             = 3e-4
+DEFAULT_GRAD_CLIP      = 1.0
+DEFAULT_WARMUP_STEPS   = 200
+DEFAULT_CHECKPOINT_DIR = "checkpoints"
+
+os.makedirs(DEFAULT_CHECKPOINT_DIR, exist_ok=True)
 
 # ──────────────────────────────────────────────
 # DATASET
@@ -51,31 +54,46 @@ def load_tokenizer_info():
 # MAIN  ← wymagane przez multiprocessing/forkserver
 # ──────────────────────────────────────────────
 def main():
-    with open("tokenized_data.pkl", "rb") as f:
-        tokenized_data = pickle.load(f)
+    parser = argparse.ArgumentParser(description="Train GPT model from scratch.")
+    parser.add_argument("--tokenized", default="tokenized_data.pkl",
+                        help="Tokenized data file (.pkl or .bin) to train on")
+    parser.add_argument("--seq_len", type=int, default=DEFAULT_SEQ_LEN)
+    parser.add_argument("--batch", type=int, default=DEFAULT_BATCH_SIZE)
+    parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
+    parser.add_argument("--lr", type=float, default=DEFAULT_LR)
+    parser.add_argument("--grad_clip", type=float, default=DEFAULT_GRAD_CLIP)
+    parser.add_argument("--warmup", type=int, default=DEFAULT_WARMUP_STEPS)
+    parser.add_argument("--out_dir", default=DEFAULT_CHECKPOINT_DIR)
+    args = parser.parse_args()
+
+    # support both pickle and binary token list
+    tokenized_data = load_tokens(args.tokenized)
 
     vocab_size, pad_idx = load_tokenizer_info()
     print(f"[INFO] Vocab size: {vocab_size} | Tokens: {len(tokenized_data)}")
 
-    dataset    = TextDataset(tokenized_data, SEQ_LEN)
+    # make sure output directory exists
+    os.makedirs(args.out_dir, exist_ok=True)
+
+    dataset    = TextDataset(tokenized_data, args.seq_len)
     # num_workers=0 — bezpieczne na każdej platformie (brak błędów forkserver)
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True,
+    dataloader = DataLoader(dataset, batch_size=args.batch, shuffle=True,
                             num_workers=0, pin_memory=True)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Device: {device}")
 
-    model     = GPTSmall(vocab_size=vocab_size, seq_len=SEQ_LEN).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-2)
+    model     = GPTSmall(vocab_size=vocab_size, seq_len=args.seq_len).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-2)
     criterion = (nn.CrossEntropyLoss(ignore_index=pad_idx)
                  if pad_idx >= 0 else nn.CrossEntropyLoss())
 
-    total_steps = EPOCHS * len(dataloader)
+    total_steps = args.epochs * len(dataloader)
 
     def lr_lambda(step):
-        if step < WARMUP_STEPS:
-            return step / max(1, WARMUP_STEPS)
-        progress = (step - WARMUP_STEPS) / max(1, total_steps - WARMUP_STEPS)
+        if step < args.warmup:
+            return step / max(1, args.warmup)
+        progress = (step - args.warmup) / max(1, total_steps - args.warmup)
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -83,10 +101,10 @@ def main():
     avg_losses = []
     best_loss  = float("inf")
 
-    for epoch in range(1, EPOCHS + 1):
+    for epoch in range(1, args.epochs + 1):
         model.train()
         running_loss = 0.0
-        loop = tqdm(dataloader, desc=f"Epoch {epoch}/{EPOCHS}", leave=False)
+        loop = tqdm(dataloader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
 
         for x, y in loop:
             x, y = x.to(device), y.to(device)
@@ -94,7 +112,7 @@ def main():
             out  = model(x)
             loss = criterion(out.view(-1, vocab_size), y.view(-1))
             loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
             scheduler.step()
             running_loss += loss.item()
@@ -103,21 +121,21 @@ def main():
 
         avg_loss = running_loss / len(dataloader)
         avg_losses.append(avg_loss)
-        print(f"Epoch {epoch}/{EPOCHS} | Avg Loss: {avg_loss:.4f} | "
+        print(f"Epoch {epoch}/{args.epochs} | Avg Loss: {avg_loss:.4f} | "
               f"LR: {scheduler.get_last_lr()[0]:.2e}")
 
         torch.save(model.state_dict(),
-                   os.path.join(CHECKPOINT_DIR, f"gpt_epoch{epoch}.pt"))
+                   os.path.join(args.out_dir, f"gpt_epoch{epoch}.pt"))
 
         if avg_loss < best_loss:
             best_loss = avg_loss
             torch.save(model.state_dict(),
-                       os.path.join(CHECKPOINT_DIR, "gpt_best.pt"))
+                       os.path.join(args.out_dir, "gpt_best.pt"))
             print(f"[BEST] loss={best_loss:.4f}")
 
     try:
         plt.figure(figsize=(10, 4))
-        plt.plot(range(1, EPOCHS + 1), avg_losses, marker="o", color="cyan")
+        plt.plot(range(1, args.epochs + 1), avg_losses, marker="o", color="cyan")
         plt.title("Training Loss per Epoch")
         plt.xlabel("Epoch"); plt.ylabel("Loss")
         plt.grid(True); plt.tight_layout()

@@ -1,0 +1,8 @@
+torch
+beautifulsoup4
+requests
+tqdm
+matplotlib
+
+# needed for loading/saving .bin token data
+numpy

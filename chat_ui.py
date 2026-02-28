@@ -8,7 +8,7 @@ from model_gpt import GPTSmall
 # ──────────────────────────────────────────────
 # CONFIG
 # ──────────────────────────────────────────────
-SEQ_LEN     = 50
+SEQ_LEN     = 100
 MAX_GEN     = 60
 TEMPERATURE = 0.85   # > 1 bardziej losowe, < 1 bardziej deterministyczne
 TOP_K       = 50     # zostaw tylko top-k tokenów
